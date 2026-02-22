@@ -8,3 +8,10 @@ Plan for my GPT-2 (based on Karpathy's NanoGPT):
 7. Residual: -------------- + ---->
               \-----MHA----/
 8. Layer norm before MHA and FFWD
+
+Plan for my GPT-OSS:
+1. ReLU -> SwiGLU in FFWD
+2. Standard feedforward -> MOE
+3. LayerNorm -> RMSNorm
+4. Multi-Head Attention -> Group Query Attention
+5. Positional Embeddings -> Learned RoPE

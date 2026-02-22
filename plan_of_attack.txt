@@ -1,0 +1,10 @@
+Plan for my GPT-2 (based on Karpathy's NanoGPT):
+1. tokenizer encode and decode functions
+2. basic bigram LLM model with forward and generate function
+3. training loop
+4. SHA
+5. MHA
+6. FFWD
+7. Residual: -------------- + ---->
+              \-----MHA----/
+8. Layer norm before MHA and FFWD

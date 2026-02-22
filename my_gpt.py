@@ -106,15 +106,16 @@ class MultiHeadAttention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, d_model):
         super().__init__()
-        self.fully_connected_1 = torch.nn.Linear(d_model, 4*d_model)
-        self.relu = torch.nn.ReLU()
-        self.fully_connected_2 = torch.nn.Linear(4*d_model, d_model)
+        hidden_size = int(4 * d_model * 2/3)  # hidden dim smaller than with ReLU because SwiGLU adds a linear layer (more params).
+        self.fc1 = torch.nn.Linear(d_model, hidden_size)
+        self.fc2 = torch.nn.Linear(d_model, hidden_size)
+        self.silu = torch.nn.SiLU()
+        self.fc3 = torch.nn.Linear(hidden_size, d_model)
 
     def forward(self, x):
-        x = self.fully_connected_1(x)
-        x = self.relu(x)
-        x = self.fully_connected_2(x)
-        return x
+        x_swiglu = self.fc1(x) * self.silu(self.fc2(x))
+        out = self.fc3(x_swiglu)
+        return out
 
 class Layer(nn.Module):
     def __init__(self, d_model, num_heads, context_length):

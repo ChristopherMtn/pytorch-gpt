@@ -1,0 +1,5 @@
+Notes
+
+1. Apple MPS (Metal Performance Shaders) doesn't throw an index out of range on 
+torch.nn.Embedding(context_length, N) if you try to embed something > context length.
+I guess undefined behaviour or garbage memory access? You need to put an assert there.

@@ -5,15 +5,17 @@ from torch.nn import functional as F
 
 torch.manual_seed(1134)
 
-context_length = 512
+context_length = 256
 batch_size = 24
 d_model = 384
 num_heads = 6
 num_layers = 5
+num_experts = 4
+active_experts = 2
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 learning_rate = 3e-4
 max_iters = 4000
-eval_interval = 200
+eval_interval = 10
 
 with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
@@ -116,14 +118,60 @@ class FeedForward(nn.Module):
         x_swiglu = self.fc1(x) * self.silu(self.fc2(x))
         out = self.fc3(x_swiglu)
         return out
+    
+class MOE(nn.Module):
+    def __init__(self, num_experts, active_experts, d_model):
+        super().__init__()
+        self.active_experts = active_experts
+        self.experts = nn.ModuleList([FeedForward(d_model) for _ in range(num_experts)])
+        self.router = nn.Linear(d_model, num_experts)
+
+    def forward(self, x):
+        #  x is (B, T, d_model)
+        B, T, d_model = x.shape
+        num_tokens = B * T
+
+        # Pick experts, build per-token weight and index tensors
+        expert_selections = self.router(x)  # (B, T, num_experts)
+        weights, indices = torch.topk(expert_selections, self.active_experts, dim=-1)  # both are dim (B, T, active_experts)
+        weights = F.softmax(weights, dim=-1)
+
+        # Aux Loss
+        # Gradient descent tends to starve, so need to add loss that punishes
+        # always choosing the same expert
+        one_hot = torch.zeros(B, T, len(self.experts), device=x.device)
+        one_hot.scatter_(-1, indices, 1.0)
+        tokens_per_expert = one_hot.sum(dim=(0, 1)) / num_tokens  # (num_experts,)
+        full_probs = F.softmax(expert_selections, dim=-1)
+        mean_prob_per_expert = full_probs.mean(dim=(0, 1))  # (num_experts,)
+        self.aux_loss = (tokens_per_expert * mean_prob_per_expert).sum() * len(self.experts)
+
+        # create output matrix by selecting and adding expert results
+        combined_output = torch.zeros_like(x)
+        for i, expert in enumerate(self.experts):
+            # Find tokens assigned to this specific expert
+            batch_coords, time_coords, topk_coords = torch.where(indices == i)
+            expert_input = x[batch_coords, time_coords]
+            expert_out = expert(expert_input)
+            combined_output[batch_coords, time_coords] += (weights[batch_coords, time_coords, topk_coords].unsqueeze(-1) * expert_out)
+
+        return combined_output
+
+
+def collect_aux_loss(model):
+    aux_loss = 0.0
+    for module in model.modules():
+        if isinstance(module, MOE) and hasattr(module, 'aux_loss'):
+            aux_loss = aux_loss + module.aux_loss
+    return aux_loss
 
 class Layer(nn.Module):
-    def __init__(self, d_model, num_heads, context_length):
+    def __init__(self, d_model, num_heads, context_length, num_experts, active_experts):
         super().__init__()
         self.layer_norm_1 = nn.LayerNorm(d_model)
         self.self_attn = MultiHeadAttention(d_model, num_heads, context_length)
         self.layer_norm_2 = nn.LayerNorm(d_model)
-        self.ffwd = FeedForward(d_model)
+        self.ffwd = MOE(num_experts, active_experts, d_model)
 
     def forward(self, x):
         x = x + self.self_attn(self.layer_norm_1(x))
@@ -131,12 +179,12 @@ class Layer(nn.Module):
         return x
 
 class LLM(nn.Module):
-    def __init__(self, d_model, num_heads, context_length):
+    def __init__(self, d_model, num_heads, context_length, num_experts, active_experts):
         # vocab_size->vocab_size means this works like a one-hot vector
         super().__init__()
         self.token_embeddings = torch.nn.Embedding(vocab_size, d_model)
         self.positional_embedding = torch.nn.Embedding(context_length, d_model)
-        self.layers = torch.nn.Sequential(*[Layer(d_model, num_heads, context_length) for _ in range(num_layers)])
+        self.layers = torch.nn.Sequential(*[Layer(d_model, num_heads, context_length, num_experts, active_experts) for _ in range(num_layers)])
         self.layer_norm = torch.nn.LayerNorm(d_model)
         self.embed_to_vocab = torch.nn.Linear(d_model, vocab_size)
 
@@ -173,7 +221,7 @@ class LLM(nn.Module):
             context = torch.cat((context, next.view(1, 1)), dim=1)
         return context
 
-model = LLM(d_model, num_heads, context_length)
+model = LLM(d_model, num_heads, context_length, num_experts, active_experts)
 model.to(device)
 print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
 
@@ -184,12 +232,15 @@ for iter in range(max_iters + 1):
 
     if iter % eval_interval == 0:
         losses = estimate_loss()
-        print(f"step {iter}: train loss {losses[SplitType.train]:.4f}, val loss {losses[SplitType.validate]:.4f}")
+        aux = collect_aux_loss(model)
+        print(f"step {iter}: train loss {losses[SplitType.train]:.4f}, val loss {losses[SplitType.validate]:.4f}, aux loss {aux:.4f}")
 
     xb, yb = get_batch()
     logits, loss = model(xb, yb)
+    aux_loss = collect_aux_loss(model)
+    total_loss = loss + 0.01 * aux_loss
     optimizer.zero_grad(set_to_none=True)
-    loss.backward()
+    total_loss.backward()
     optimizer.step()
 
 

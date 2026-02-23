@@ -12,6 +12,7 @@ num_heads = 6
 num_layers = 5
 num_experts = 4
 active_experts = 2
+num_kv_heads = 2
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 learning_rate = 3e-4
 max_iters = 4000
@@ -82,38 +83,42 @@ class RMSNorm(nn.Module):
         rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
         return x / rms * self.weight
 
-class MaskedSelfAttention(nn.Module):
-    def __init__(self, head_size, d_model, context_length):
+class GroupQueryAttention(nn.Module):
+    def __init__(self, d_model, head_size, num_heads, num_kv_heads, context_length):
         super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.groups = num_heads // num_kv_heads  # Q heads per KV head
         self.head_size = head_size
-        self.query = nn.Linear(d_model, head_size, bias=False)
-        self.key = nn.Linear(d_model, head_size, bias=False)
-        self.value = nn.Linear(d_model, head_size, bias=False)
+
+        self.query = nn.Linear(d_model, num_heads * self.head_size, bias=False)
+        self.key = nn.Linear(d_model, num_kv_heads * self.head_size, bias=False)
+        self.value = nn.Linear(d_model, num_kv_heads * self.head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(context_length, context_length)))
 
     def forward(self, x):
-        B, T, C = x.shape
-        q = self.query(x)  # (B, T, hs)
-        k = self.key(x)  # (B, T, hs)
-        v = self.value(x)  # (B, T, hs)
-        qkt = q @ k.transpose(1, 2) / self.head_size**0.5 # (B, T, T)
-        qkt = qkt.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B, T, T) masked
-        softmax_qkt = torch.nn.functional.softmax(qkt, -1)  # (B, T, T)
-        result = softmax_qkt @ v  # (B, T, hs)
-        return result  # (B, T, hs)
-    
-class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, num_heads, context_length):
-        super().__init__()
-        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
-        head_size = d_model // num_heads
-        self.heads = nn.ModuleList([MaskedSelfAttention(head_size, d_model, context_length) for _ in range(num_heads)])
-        self.proj = nn.Linear(d_model, d_model)
+        B, T, _ = x.shape
 
-    def forward(self, x):
-        x = torch.cat([h(x) for h in self.heads], dim=-1)
-        res = self.proj(x)
-        return res
+        q = self.query(x).view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        # (B, num_heads, T, head_size)
+
+        k = self.key(x).view(B, T, self.num_kv_heads, self.head_size).transpose(1, 2)
+        v = self.value(x).view(B, T, self.num_kv_heads, self.head_size).transpose(1, 2)
+        # (B, num_kv_heads, T, head_size)
+
+        # Expand K/V so each KV head broadcasts across its group of Q heads
+        # (B, num_heads, T, head_size) via repeat_interleave
+        k = k.repeat_interleave(self.groups, dim=1)
+        v = v.repeat_interleave(self.groups, dim=1)
+
+        scale = self.head_size ** 0.5
+        attn = (q @ k.transpose(-2, -1)) / scale  # (B, num_heads, T, T)
+        attn = attn.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        attn = F.softmax(attn, dim=-1)
+
+        out = attn @ v  # (B, num_heads, T, head_size)
+        out = out.transpose(1, 2).contiguous().view(B, T, -1)  # (B, T, d_model)
+        return out
 
 class FeedForward(nn.Module):
     def __init__(self, d_model):
@@ -176,10 +181,12 @@ def collect_aux_loss(model):
     return aux_loss
 
 class Layer(nn.Module):
-    def __init__(self, d_model, num_heads, context_length, num_experts, active_experts):
+    def __init__(self, d_model, num_heads, num_kv_heads, context_length, num_experts, active_experts):
         super().__init__()
         self.rms_norm_1 = RMSNorm(d_model)
-        self.self_attn = MultiHeadAttention(d_model, num_heads, context_length)
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        head_size = d_model // num_heads
+        self.self_attn = GroupQueryAttention(d_model, head_size, num_heads, num_kv_heads, context_length)
         self.rms_norm_2 = RMSNorm(d_model)
         self.ffwd = MOE(num_experts, active_experts, d_model)
 
@@ -189,12 +196,12 @@ class Layer(nn.Module):
         return x
 
 class LLM(nn.Module):
-    def __init__(self, d_model, num_heads, context_length, num_experts, active_experts):
+    def __init__(self, d_model, num_heads, num_kv_heads, context_length, num_experts, active_experts):
         # vocab_size->vocab_size means this works like a one-hot vector
         super().__init__()
         self.token_embeddings = torch.nn.Embedding(vocab_size, d_model)
         self.positional_embedding = torch.nn.Embedding(context_length, d_model)
-        self.layers = torch.nn.Sequential(*[Layer(d_model, num_heads, context_length, num_experts, active_experts) for _ in range(num_layers)])
+        self.layers = torch.nn.Sequential(*[Layer(d_model, num_heads, num_kv_heads, context_length, num_experts, active_experts) for _ in range(num_layers)])
         self.rms_norm = RMSNorm(d_model)
         self.embed_to_vocab = torch.nn.Linear(d_model, vocab_size)
 
@@ -231,7 +238,7 @@ class LLM(nn.Module):
             context = torch.cat((context, next.view(1, 1)), dim=1)
         return context
 
-model = LLM(d_model, num_heads, context_length, num_experts, active_experts)
+model = LLM(d_model, num_heads, num_kv_heads, context_length, num_experts, active_experts)
 model.to(device)
 print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
 

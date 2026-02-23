@@ -72,6 +72,16 @@ def estimate_loss():
     model.train()
     return out
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        return x / rms * self.weight
+
 class MaskedSelfAttention(nn.Module):
     def __init__(self, head_size, d_model, context_length):
         super().__init__()
@@ -168,14 +178,14 @@ def collect_aux_loss(model):
 class Layer(nn.Module):
     def __init__(self, d_model, num_heads, context_length, num_experts, active_experts):
         super().__init__()
-        self.layer_norm_1 = nn.LayerNorm(d_model)
+        self.rms_norm_1 = RMSNorm(d_model)
         self.self_attn = MultiHeadAttention(d_model, num_heads, context_length)
-        self.layer_norm_2 = nn.LayerNorm(d_model)
+        self.rms_norm_2 = RMSNorm(d_model)
         self.ffwd = MOE(num_experts, active_experts, d_model)
 
     def forward(self, x):
-        x = x + self.self_attn(self.layer_norm_1(x))
-        x = x + self.ffwd(self.layer_norm_2(x))
+        x = x + self.self_attn(self.rms_norm_1(x))
+        x = x + self.ffwd(self.rms_norm_2(x))
         return x
 
 class LLM(nn.Module):
@@ -185,7 +195,7 @@ class LLM(nn.Module):
         self.token_embeddings = torch.nn.Embedding(vocab_size, d_model)
         self.positional_embedding = torch.nn.Embedding(context_length, d_model)
         self.layers = torch.nn.Sequential(*[Layer(d_model, num_heads, context_length, num_experts, active_experts) for _ in range(num_layers)])
-        self.layer_norm = torch.nn.LayerNorm(d_model)
+        self.rms_norm = RMSNorm(d_model)
         self.embed_to_vocab = torch.nn.Linear(d_model, vocab_size)
 
     def forward(self, inputs, targets=None):
@@ -196,7 +206,7 @@ class LLM(nn.Module):
         positional_embeddings = self.positional_embedding(torch.arange(T, device=device))  # (B, T, n_embed)
         x = token_embeddings + positional_embeddings  # (B, T, n_embed)
         x = self.layers(x)  # (B, T, n_embed)
-        x = self.layer_norm(x)  # Deviating from Attention is All You Need, adding LNs before heads and FF. Final LN here.
+        x = self.rms_norm(x)  # Deviating from Attention is All You Need, adding norms before heads and FF. Final norm here.
         logits = self.embed_to_vocab(x)  # (B, T, vocab_size)
 
         if targets is None:

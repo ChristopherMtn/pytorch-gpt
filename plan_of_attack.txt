@@ -15,3 +15,7 @@ Plan for my GPT-OSS:
 3. LayerNorm -> RMSNorm
 4. Multi-Head Attention -> Group Query Attention
 5. Positional Embeddings -> Learned RoPE
+
+Misc:
+- Refactor each module into its own file, with entry-point as training file
+- Add KV-Cachine to optimize inference

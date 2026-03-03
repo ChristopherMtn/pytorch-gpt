@@ -4,19 +4,20 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 torch.manual_seed(1134)
+torch.set_float32_matmul_precision('high')  # Apparently speeds up Apple silicon
 
-context_length = 256
-batch_size = 24
-d_model = 384
-num_heads = 6
-num_layers = 5
-num_experts = 4
-active_experts = 2
+context_length = 128
+batch_size = 20
+d_model = 448
+num_heads = 8
+num_layers = 6
+num_experts = 2
+active_experts = 1
 num_kv_heads = 2
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 learning_rate = 3e-4
-max_iters = 4000
-eval_interval = 10
+max_iters = 5000
+eval_interval = 200
 
 with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
@@ -86,6 +87,8 @@ class RMSNorm(nn.Module):
 class GroupQueryAttention(nn.Module):
     def __init__(self, d_model, head_size, num_heads, num_kv_heads, context_length):
         super().__init__()
+        assert num_heads % num_kv_heads == 0, "GQA requires clean divisibility"
+
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.groups = num_heads // num_kv_heads  # Q heads per KV head

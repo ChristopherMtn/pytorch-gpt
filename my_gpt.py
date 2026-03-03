@@ -96,6 +96,40 @@ class GroupQueryAttention(nn.Module):
         self.value = nn.Linear(d_model, num_kv_heads * self.head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(context_length, context_length)))
 
+        # RoPE
+        base=10000
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, head_size, 2).float() / head_size)
+        )
+        t = torch.arange(context_length).float()
+        freqs = torch.outer(t, inv_freq)  # (T, head_size/2)
+
+        self.register_buffer("cos_cached", torch.cos(freqs))
+        self.register_buffer("sin_cached", torch.sin(freqs))
+
+    def apply_rotary_emb(self, x, T):
+        """
+        x: (B, n_heads, T, head_size)
+        """
+        cos = self.cos_cached[:T]  # (T, head_size/2)
+        sin = self.sin_cached[:T]
+
+        # reshape for broadcasting
+        cos = cos.unsqueeze(0).unsqueeze(0)  # (1,1,T,head_size/2)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+
+        # split into pairs
+        x = x.view(*x.shape[:-1], self.head_size // 2, 2)
+        x1 = x[..., 0]
+        x2 = x[..., 1]
+
+        # rotate
+        rotated_x1 = x1 * cos - x2 * sin
+        rotated_x2 = x1 * sin + x2 * cos
+
+        x = torch.stack((rotated_x1, rotated_x2), dim=-1)
+        return x.view(*x.shape[:-2], self.head_size)
+
     def forward(self, x):
         B, T, _ = x.shape
 
@@ -105,6 +139,10 @@ class GroupQueryAttention(nn.Module):
         k = self.key(x).view(B, T, self.num_kv_heads, self.head_size).transpose(1, 2)
         v = self.value(x).view(B, T, self.num_kv_heads, self.head_size).transpose(1, 2)
         # (B, num_kv_heads, T, head_size)
+
+        # Apply RoPE to Q and K
+        q = self.apply_rotary_emb(q, T)
+        k = self.apply_rotary_emb(k, T)
 
         # Expand K/V so each KV head broadcasts across its group of Q heads
         # (B, num_heads, T, head_size) via repeat_interleave
@@ -200,7 +238,6 @@ class LLM(nn.Module):
         # vocab_size->vocab_size means this works like a one-hot vector
         super().__init__()
         self.token_embeddings = torch.nn.Embedding(vocab_size, d_model)
-        self.positional_embedding = torch.nn.Embedding(context_length, d_model)
         self.layers = torch.nn.Sequential(*[Layer(d_model, num_heads, num_kv_heads, context_length, num_experts, active_experts) for _ in range(num_layers)])
         self.rms_norm = RMSNorm(d_model)
         self.embed_to_vocab = torch.nn.Linear(d_model, vocab_size)
@@ -210,9 +247,7 @@ class LLM(nn.Module):
         B, T = inputs.shape
         assert T <= context_length, f'time dim ({T}) is larger than supported context length ({context_length})'  # Need to check this on MPS backend
         token_embeddings = self.token_embeddings(inputs)  # (B, T, n_embed)
-        positional_embeddings = self.positional_embedding(torch.arange(T, device=device))  # (B, T, n_embed)
-        x = token_embeddings + positional_embeddings  # (B, T, n_embed)
-        x = self.layers(x)  # (B, T, n_embed)
+        x = self.layers(token_embeddings)  # (B, T, n_embed)
         x = self.rms_norm(x)  # Deviating from Attention is All You Need, adding norms before heads and FF. Final norm here.
         logits = self.embed_to_vocab(x)  # (B, T, vocab_size)
 

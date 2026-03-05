@@ -1,3 +1,4 @@
 *.pt
 test_script.py
 to_learn.txt
+__pycache__

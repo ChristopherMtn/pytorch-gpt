@@ -17,5 +17,5 @@ Plan for my GPT-OSS:
 5. Positional Embeddings -> Learned RoPE
 
 Misc:
-- Refactor each module into its own file, with entry-point as training file
 - Add KV-Cachine to optimize inference
+- Add pyproject.toml to setup as editable package and make imports/running cleaner
